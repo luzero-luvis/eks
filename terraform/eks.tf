@@ -2,23 +2,23 @@ module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "~> 21.0"
 
-  cluster_name    = local.name
-  cluster_version = var.cluster_version
+  name               = local.name
+  kubernetes_version = var.cluster_version
 
   # Public+private: operators reach the API over public; nodes use private.
   # Restrict public access to known CIDRs in prod (set via var).
-  cluster_endpoint_public_access       = true
-  cluster_endpoint_private_access      = true
-  cluster_endpoint_public_access_cidrs = var.cluster_endpoint_public_access_cidrs
+  endpoint_public_access       = true
+  endpoint_private_access      = true
+  endpoint_public_access_cidrs = var.cluster_endpoint_public_access_cidrs
 
   # Envelope-encrypt all Kubernetes Secrets with a customer-managed KMS key
-  cluster_encryption_config = {
+  encryption_config = {
     provider_key_arn = aws_kms_key.eks.arn
     resources        = ["secrets"]
   }
 
   # Full control-plane log retention for audit/compliance
-  cluster_enabled_log_types = [
+  enabled_log_types = [
     "api", "audit", "authenticator", "controllerManager", "scheduler"
   ]
 
@@ -35,7 +35,7 @@ module "eks" {
   enable_cluster_creator_admin_permissions = true
 
   # ── EKS Managed Add-ons ─────────────────────────────────────────────────────
-  cluster_addons = {
+  addons = {
     # VPC CNI must be installed before nodes to avoid IP exhaustion race
     vpc-cni = {
       before_compute              = true
@@ -105,7 +105,7 @@ module "eks" {
       most_recent                 = true
       resolve_conflicts_on_create = "OVERWRITE"
       resolve_conflicts_on_update = "PRESERVE"
-      service_account_role_arn    = module.ebs_csi_irsa.iam_role_arn
+      service_account_role_arn    = module.ebs_csi_irsa.arn
     }
   }
 
@@ -146,18 +146,18 @@ module "eks" {
       }
 
       labels = {
-        "node-role"                = "system"
-        "karpenter.sh/controller"  = "true"
+        "node-role"               = "system"
+        "karpenter.sh/controller" = "true"
       }
 
       # Taint keeps application pods off system nodes; Karpenter/CoreDNS tolerate it
-      taints = [
-        {
+      taints = {
+        CriticalAddonsOnly = {
           key    = "CriticalAddonsOnly"
           value  = "true"
           effect = "NO_SCHEDULE"
         }
-      ]
+      }
 
       tags = {
         "karpenter.sh/discovery" = local.name

@@ -18,11 +18,6 @@ resource "aws_kms_alias" "state" {
 resource "aws_s3_bucket" "state" {
   bucket = var.bucket_name
 
-  # Prevent accidental deletion of the bucket that holds all Terraform state
-  lifecycle {
-    prevent_destroy = true
-  }
-
   tags = {
     Name = var.bucket_name
   }

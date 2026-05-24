@@ -30,7 +30,7 @@ resource "helm_release" "alb_controller" {
 
   set {
     name  = "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
-    value = module.alb_controller_irsa.iam_role_arn
+    value = module.alb_controller_irsa.arn
   }
 
   # Two replicas spread across AZs for HA

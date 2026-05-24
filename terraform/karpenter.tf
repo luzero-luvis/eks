@@ -7,11 +7,7 @@ module "karpenter" {
 
   cluster_name = module.eks.cluster_name
 
-  # v1 permissions schema (Karpenter >= 1.0)
-  enable_v1_permissions = true
-
   # Pod Identity association — no OIDC token projection needed
-  enable_pod_identity             = true
   create_pod_identity_association = true
 
   # SSM access lets nodes fetch AMI IDs and be managed via Session Manager
