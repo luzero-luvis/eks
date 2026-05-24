@@ -1,0 +1,19 @@
+aws_region   = "us-east-1"
+cluster_name = "prod-eks"
+project      = "luvis"
+environment  = "prod"
+owner        = "platform"
+
+cluster_version = "1.32"
+vpc_cidr        = "10.0.0.0/16"
+
+# Lock down to your VPN/office CIDR in production!
+cluster_endpoint_public_access_cidrs = ["203.0.113.0/24"]
+
+system_node_instance_types = ["m5.large", "m5a.large", "m6i.large"]
+system_node_min_size       = 2
+system_node_max_size       = 4
+system_node_desired_size   = 2
+
+karpenter_version      = "1.0.6"
+alb_controller_version = "1.8.4"
