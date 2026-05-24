@@ -3,7 +3,7 @@
 # Pod Identity is used (preferred over IRSA for Karpenter v1+).
 module "karpenter" {
   source  = "terraform-aws-modules/eks/aws//modules/karpenter"
-  version = "~> 20.0"
+  version = "~> 21.0"
 
   cluster_name = module.eks.cluster_name
 
@@ -101,7 +101,7 @@ resource "kubectl_manifest" "karpenter_node_class" {
       # Find versions: aws ssm get-parameters-by-path \
       #   --path /aws/service/eks/optimized-ami/${var.cluster_version}/amazon-linux-2023/
       amiSelectorTerms:
-        - alias: al2023@v20250519
+        - alias: al2023@v20260501
       role: ${module.karpenter.node_iam_role_name}
       subnetSelectorTerms:
         - tags:

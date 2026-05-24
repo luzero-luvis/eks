@@ -13,7 +13,7 @@ variable "cluster_name" {
 variable "cluster_version" {
   description = "Kubernetes version"
   type        = string
-  default     = "1.32"
+  default     = "1.35"
 }
 
 variable "project" {
@@ -73,12 +73,12 @@ variable "system_node_desired_size" {
 variable "karpenter_version" {
   description = "Karpenter Helm chart version"
   type        = string
-  default     = "1.0.6"
+  default     = "1.12.1"
 }
 
-# ALB controller Helm chart version — check https://artifacthub.io/packages/helm/aws/aws-load-balancer-controller
+# ALB controller Helm chart version — check https://github.com/aws/eks-charts/blob/master/stable/aws-load-balancer-controller/Chart.yaml
 variable "alb_controller_version" {
   description = "AWS Load Balancer Controller Helm chart version"
   type        = string
-  default     = "1.8.4"
+  default     = "3.3.0"
 }
