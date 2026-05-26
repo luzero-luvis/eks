@@ -1,67 +1,130 @@
 # EKS Production Cluster
 
-Production-grade EKS cluster built with Terraform following the [AWS EKS Best Practices Guide](https://docs.aws.amazon.com/eks/latest/best-practices/introduction.html).
+> Production-grade Amazon EKS cluster provisioned with Terraform, following the [AWS EKS Best Practices Guide](https://docs.aws.amazon.com/eks/latest/best-practices/introduction.html).
+
+---
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Architecture](#architecture)
+3. [Components](#components)
+4. [Directory Structure](#directory-structure)
+5. [Prerequisites](#prerequisites)
+6. [Deployment Guide](#deployment-guide)
+7. [Best Practices](#best-practices)
+   - [Security](#security)
+   - [Networking](#networking)
+   - [Reliability](#reliability)
+   - [Karpenter — Node Autoscaling](#karpenter--node-autoscaling)
+   - [Storage](#storage)
+   - [Cost Optimisation](#cost-optimisation)
+   - [Cluster Upgrades](#cluster-upgrades)
+8. [Day-2 Operations](#day-2-operations)
+9. [Adding Storage Later](#adding-storage-later)
+10. [Estimated Cost](#estimated-cost)
+11. [References](#references)
+
+---
+
+## Overview
+
+This repository provisions a production-ready Amazon EKS cluster using Terraform. Every design decision follows the official AWS EKS Best Practices Guide. The cluster is built for:
+
+- **Security** — encrypted secrets, private nodes, IRSA, IMDSv2, network policies
+- **Reliability** — multi-AZ, dedicated system nodes, CoreDNS HA, auto node repair
+- **Scalability** — Karpenter dynamically provisions nodes in seconds based on pod demand
+- **Cost efficiency** — Spot instances for application workloads, gp3 storage, no unnecessary resources
+
+The repository is split into two independent Terraform roots:
+
+| Directory | Purpose |
+|---|---|
+| `bootstrap/` | Creates the S3 state bucket. Run once before anything else. |
+| `terraform/` | Provisions the full EKS cluster. |
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         AWS Account                             │
-│                                                                 │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │                    VPC (10.0.0.0/16)                      │  │
-│  │                                                           │  │
-│  │        AZ-1              AZ-2              AZ-3           │  │
-│  │  ┌────────────┐    ┌────────────┐    ┌────────────┐       │  │
-│  │  │   Public   │    │   Public   │    │   Public   │       │  │
-│  │  │ 10.0.48/24 │    │ 10.0.49/24 │    │ 10.0.50/24 │       │  │
-│  │  │  (NAT GW)  │    │  (NAT GW)  │    │  (NAT GW)  │       │  │
-│  │  └────────────┘    └────────────┘    └────────────┘       │  │
-│  │  ┌────────────┐    ┌────────────┐    ┌────────────┐       │  │
-│  │  │  Private   │    │  Private   │    │  Private   │       │  │
-│  │  │  10.0.0/20 │    │ 10.0.16/20 │    │ 10.0.32/20 │       │  │
-│  │  │   nodes    │    │   nodes    │    │   nodes    │       │  │
-│  │  │   pods     │    │   pods     │    │   pods     │       │  │
-│  │  └────────────┘    └────────────┘    └────────────┘       │  │
-│  │  ┌────────────┐    ┌────────────┐    ┌────────────┐       │  │
-│  │  │   Intra    │    │   Intra    │    │   Intra    │       │  │
-│  │  │ 10.0.52/28 │    │ 10.0.53/28 │    │ 10.0.54/28 │       │  │
-│  │  │ (ctrl ENI) │    │ (ctrl ENI) │    │ (ctrl ENI) │       │  │
-│  │  └────────────┘    └────────────┘    └────────────┘       │  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │        EKS Control Plane  (AWS managed, 3 AZs)          │    │
-│  │   API Server  |  etcd  |  Controller Manager            │    │
-│  └─────────────────────────────────────────────────────────┘    │
-│                                                                 │
-│  Worker Nodes                                                   │
-│  ├── System MNG  2–4× m5.large  ON_DEMAND  AL2023              │
-│  │   └── Karpenter  CoreDNS  ALB Controller  EBS CSI           │
-│  └── Karpenter  c/m/r gen3+  Spot→On-Demand  dynamic          │
-│      └── Application workloads                                 │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                            AWS Account                               │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │                      VPC  10.0.0.0/16                         │  │
+│  │                                                                │  │
+│  │         AZ-1                 AZ-2                 AZ-3         │  │
+│  │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐      │  │
+│  │  │    Public    │    │    Public    │    │    Public    │      │  │
+│  │  │ 10.0.48.0/24 │    │ 10.0.49.0/24 │    │ 10.0.50.0/24 │      │  │
+│  │  │  NAT Gateway │    │  NAT Gateway │    │  NAT Gateway │      │  │
+│  │  │  Internet LB │    │  Internet LB │    │  Internet LB │      │  │
+│  │  └──────────────┘    └──────────────┘    └──────────────┘      │  │
+│  │         │                   │                   │              │  │
+│  │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐      │  │
+│  │  │   Private    │    │   Private    │    │   Private    │      │  │
+│  │  │  10.0.0.0/20 │    │ 10.0.16.0/20 │    │ 10.0.32.0/20 │      │  │
+│  │  │ Worker nodes │    │ Worker nodes │    │ Worker nodes │      │  │
+│  │  │  Pod IPs     │    │  Pod IPs     │    │  Pod IPs     │      │  │
+│  │  └──────────────┘    └──────────────┘    └──────────────┘      │  │
+│  │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐      │  │
+│  │  │    Intra     │    │    Intra     │    │    Intra     │      │  │
+│  │  │ 10.0.52.0/28 │    │ 10.0.53.0/28 │    │ 10.0.54.0/28 │      │  │
+│  │  │  Ctrl ENIs   │    │  Ctrl ENIs   │    │  Ctrl ENIs   │      │  │
+│  │  └──────────────┘    └──────────────┘    └──────────────┘      │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │          EKS Control Plane  (AWS managed across 3 AZs)        │  │
+│  │         API Server  │  etcd  │  Controller Manager            │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ┌─────────────────────────────┐  ┌──────────────────────────────┐  │
+│  │     System Node Group       │  │     Karpenter Node Pool      │  │
+│  │  2–4 × m5.large  ON_DEMAND  │  │  c/m/r gen3+  Spot→On-Demand │  │
+│  │  Karpenter  CoreDNS         │  │  Application workloads       │  │
+│  │  ALB Controller  EBS CSI    │  │  0 → unlimited (capped)      │  │
+│  └─────────────────────────────┘  └──────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────┘
 ```
+
+### Traffic Flow
+
+```
+Internet
+   │
+   ▼
+ALB / NLB  (public subnet — provisioned by AWS Load Balancer Controller)
+   │  HTTPS / TCP
+   ▼
+Pod  (private subnet — no public IP, no direct inbound access)
+   │  internal VPC IP
+   ▼
+Other Pods / Services  (all traffic stays on private IPs inside the VPC)
+```
+
+### Node Communication
+
+All node-to-node and pod-to-pod traffic uses **private VPC IPs only**. Nodes have no public IP addresses. Outbound internet access (image pulls, AWS API calls) routes through NAT Gateways. Nothing outside the VPC can reach nodes or pods directly.
 
 ---
 
-## What's Included
+## Components
 
-| Component | Version | Purpose |
+| Component | Version | Role |
 |---|---|---|
-| EKS Control Plane | 1.35 | Managed Kubernetes — AWS runs and patches it |
-| VPC | — | 3-AZ network with public/private/intra tiers |
-| System Node Group | AL2023 | Fixed ON_DEMAND nodes for cluster infrastructure |
-| Karpenter | 1.12.1 | Dynamic application node provisioning |
-| AWS Load Balancer Controller | 3.3.0 | Creates ALB/NLB from Kubernetes Ingress/Service |
-| EBS CSI Driver | latest | Persistent block storage for stateful workloads |
-| VPC CNI | latest | Native AWS pod networking with prefix delegation |
-| CoreDNS | latest | Cluster DNS with autoscaling and lameduck |
-| Node Monitoring Agent | latest | Detects and repairs unhealthy nodes |
-| KMS (×2) | — | Encryption for Secrets and EBS volumes |
-| Network Policies | — | Default-deny with explicit allow rules |
+| **EKS Control Plane** | Kubernetes 1.35 | Managed API server, etcd, scheduler — AWS operated |
+| **VPC** | — | 3-AZ network with public / private / intra subnet tiers |
+| **System Node Group** | AL2023, m5.large | Fixed ON_DEMAND nodes for cluster infrastructure |
+| **Karpenter** | 1.12.1 | Dynamically provisions application nodes on demand |
+| **AWS Load Balancer Controller** | 3.3.0 | Creates ALB/NLB resources from Kubernetes Ingress/Service |
+| **EBS CSI Driver** | latest | Block storage persistent volumes for stateful workloads |
+| **VPC CNI** | latest | Native AWS pod networking with prefix delegation |
+| **CoreDNS** | latest | Cluster DNS with lameduck shutdown and proportional autoscaling |
+| **Node Monitoring Agent** | latest | Detects fatal node conditions and triggers auto-repair |
+| **KMS (×2)** | — | Customer-managed encryption for Secrets and EBS volumes |
+| **Network Policies** | — | Default-deny with explicit allow rules per namespace |
 
 ---
 
@@ -69,145 +132,189 @@ Production-grade EKS cluster built with Terraform following the [AWS EKS Best Pr
 
 ```
 eks/
-├── bootstrap/                  # Run once — creates S3 state bucket
-│   ├── main.tf                 # S3 bucket + KMS key
+│
+├── bootstrap/                    # Step 1 — run once to create state bucket
+│   ├── main.tf                   # S3 bucket + KMS key
 │   ├── variables.tf
-│   ├── outputs.tf              # Prints backend.tf config to copy
+│   ├── outputs.tf                # Prints backend.tf snippet after apply
 │   ├── providers.tf
 │   ├── versions.tf
-│   └── terraform.tfvars.example
-└── terraform/                  # Main EKS cluster
-    ├── versions.tf             # Provider version pins
-    ├── providers.tf            # AWS, Kubernetes, Helm, kubectl
-    ├── locals.tf               # Computed values (AZs, subnet CIDRs, tags)
-    ├── variables.tf            # All input variables with defaults
-    ├── data.tf                 # AWS data sources
-    ├── kms.tf                  # KMS key for Secrets + KMS key for EBS
-    ├── vpc.tf                  # VPC, subnets, NAT GW, flow logs
-    ├── eks.tf                  # EKS cluster, add-ons, system node group
-    ├── irsa.tf                 # IRSA roles for EBS CSI + ALB Controller
-    ├── karpenter.tf            # Karpenter IAM, Helm, NodeClass, NodePool
-    ├── alb_controller.tf       # ALB Controller Helm release
-    ├── storage.tf              # gp3 default StorageClass
-    ├── network_policies.tf     # Default-deny + CoreDNS autoscaler
-    ├── outputs.tf
-    └── terraform.tfvars.example
+│   └── terraform.tfvars.example  # Copy to terraform.tfvars and edit
+│
+└── terraform/                    # Step 2 — main cluster
+    ├── backend.tf                # Created manually from bootstrap output (gitignored)
+    ├── versions.tf               # Pinned provider versions
+    ├── providers.tf              # AWS, Kubernetes, Helm, kubectl providers
+    ├── locals.tf                 # Computed values: AZs, CIDRs, common tags
+    ├── variables.tf              # All input variables with documented defaults
+    ├── data.tf                   # AWS data sources (AZs, caller identity, partition)
+    ├── kms.tf                    # KMS key for Secrets encryption + KMS key for EBS
+    ├── vpc.tf                    # VPC, subnets, NAT GW, flow logs, subnet tags
+    ├── eks.tf                    # EKS cluster, managed add-ons, system node group
+    ├── irsa.tf                   # IRSA roles for EBS CSI driver and ALB Controller
+    ├── karpenter.tf              # Karpenter IAM, Helm release, NodeClass, NodePool
+    ├── alb_controller.tf         # AWS Load Balancer Controller Helm release
+    ├── storage.tf                # gp3 default StorageClass, demote gp2
+    ├── network_policies.tf       # Default-deny NetworkPolicy + CoreDNS autoscaler
+    ├── outputs.tf                # Cluster endpoint, kubeconfig command, subnet IDs
+    └── terraform.tfvars.example  # Example values — copy to terraform.tfvars
 ```
 
 ---
 
 ## Prerequisites
 
-- Terraform >= 1.10
-- AWS CLI configured (`aws configure`)
-- `kubectl`
-- `helm`
+| Tool | Version | Purpose |
+|---|---|---|
+| Terraform | >= 1.10 | Infrastructure provisioning |
+| AWS CLI | >= 2.0 | AWS authentication and API access |
+| kubectl | >= 1.29 | Kubernetes cluster management |
+| helm | >= 3.0 | Kubernetes package management |
+
+**AWS permissions required:**
+
+The IAM user or role running Terraform needs permissions to create EKS clusters, VPCs, IAM roles, KMS keys, S3 buckets, EC2 instances, and associated resources. In most organisations this is a dedicated `terraform-deployer` role.
 
 ---
 
-## Deploy
+## Deployment Guide
 
-### Step 1 — Bootstrap state bucket (one time only)
+### Step 1 — Bootstrap the state bucket
+
+The state bucket must exist before the main cluster can be deployed. This step is run once per AWS account.
 
 ```bash
 cd bootstrap
 cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars — set a globally unique bucket_name
+```
+
+Edit `terraform.tfvars`:
+
+```hcl
+aws_region  = "us-east-1"
+project     = "luvis"
+bucket_name = "luvis-terraform-state-eks-2026"  # must be globally unique
+```
+
+```bash
 terraform init
 terraform apply
+```
 
-# Copy the printed backend config
+After apply, copy the printed backend config:
+
+```bash
 terraform output backend_config
 ```
 
-### Step 2 — Deploy the cluster
+---
 
-```bash
-cd ../terraform
+### Step 2 — Configure the remote backend
 
-# Paste the backend config from Step 1 into a new file
-cat > backend.tf << 'EOF'
+Create `terraform/backend.tf` using the output from Step 1:
+
+```hcl
 terraform {
   backend "s3" {
-    bucket       = "your-bucket-name"
+    bucket       = "luvis-terraform-state-eks-2026"
     key          = "prod/eks/terraform.tfstate"
     region       = "us-east-1"
     encrypt      = true
-    kms_key_id   = "arn:aws:kms:..."
+    kms_key_id   = "arn:aws:kms:us-east-1:xxxxxxxxxxxx:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
     use_lockfile = true
   }
 }
-EOF
-
-cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars with your values
-terraform init
-terraform apply   # takes ~20–25 minutes
 ```
 
-### Step 3 — Configure kubectl
+> `backend.tf` is gitignored — it contains account-specific values that differ per environment.
+
+---
+
+### Step 3 — Configure cluster variables
+
+```bash
+cd terraform
+cp terraform.tfvars.example terraform.tfvars
+```
+
+Edit `terraform.tfvars` with your values:
+
+```hcl
+aws_region   = "us-east-1"
+cluster_name = "prod-eks"
+project      = "luvis"
+environment  = "prod"
+owner        = "platform"
+
+cluster_version = "1.35"
+vpc_cidr        = "10.0.0.0/16"
+
+# Restrict to your VPN or office IP range — never leave as 0.0.0.0/0 in prod
+cluster_endpoint_public_access_cidrs = ["203.0.113.0/24"]
+
+system_node_instance_types = ["m5.large", "m5a.large", "m6i.large"]
+system_node_min_size       = 2
+system_node_max_size       = 4
+system_node_desired_size   = 2
+
+karpenter_version      = "1.12.1"
+alb_controller_version = "3.3.0"
+```
+
+---
+
+### Step 4 — Deploy the cluster
+
+```bash
+terraform init
+terraform plan   # review what will be created
+terraform apply  # takes approximately 20–25 minutes
+```
+
+The EKS control plane takes 10–15 minutes. This is an AWS-side operation — nothing can speed it up.
+
+---
+
+### Step 5 — Configure kubectl
 
 ```bash
 aws eks update-kubeconfig --region us-east-1 --name prod-eks
 kubectl get nodes
 ```
 
+Expected output — 2 system nodes in `Ready` state:
+
+```
+NAME                          STATUS   ROLES    AGE   VERSION
+ip-10-0-1-x.ec2.internal      Ready    <none>   2m    v1.35.x
+ip-10-0-17-x.ec2.internal     Ready    <none>   2m    v1.35.x
+```
+
 ---
 
-## Destroy
+### Destroy
 
 ```bash
 # Destroy the cluster first
 cd terraform
 terraform destroy
 
-# Then destroy the state bucket if needed
+# Then destroy the state bucket if no longer needed
 cd ../bootstrap
 terraform destroy
 ```
+
+> The KMS key has a 7-day deletion window enforced by AWS. It will not be fully deleted for 7 days after destroy.
 
 ---
 
 ## Best Practices
 
-### 1. Security
+### Security
 
-#### Identity and Access Management (IAM)
+#### 1. Encryption at Rest — Kubernetes Secrets
 
-**IRSA — IAM Roles for Service Accounts**
-
-Every add-on (EBS CSI, ALB Controller) gets its own dedicated IAM role bound to its Kubernetes service account via OIDC federation. Pods assume the role automatically — no long-lived credentials stored anywhere, no node-level IAM permissions shared across all pods.
-
-```hcl
-# irsa.tf — each component gets its own least-privilege role
-module "ebs_csi_irsa" {
-  source                = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts"
-  name                  = "${local.name}-ebs-csi"
-  attach_ebs_csi_policy = true
-  oidc_providers        = { main = { provider_arn = module.eks.oidc_provider_arn ... } }
-}
-```
-
-**EKS Access Entries (no aws-auth ConfigMap)**
-
-Cluster access is managed through EKS Access Entries (IAM principal → cluster permission mapping). This avoids manual edits to the `aws-auth` ConfigMap which is error-prone and can lock you out.
-
-```hcl
-enable_cluster_creator_admin_permissions = true
-```
-
-**Least Privilege**
-- Each IRSA role only has the permissions its specific add-on needs
-- No `*` actions or `*` resources in any policy
-- Node IAM role only has permissions needed to join the cluster and pull images
-
----
-
-#### Encryption
-
-**KMS Envelope Encryption for Kubernetes Secrets**
-
-All Kubernetes Secrets are encrypted at rest using a customer-managed KMS key. Without this, Secrets are base64-encoded in etcd — readable by anyone with etcd access.
+All Kubernetes Secrets are envelope-encrypted using a customer-managed KMS key. Without this, Secrets are stored as base64 in etcd — readable by anyone with etcd access.
 
 ```hcl
 # eks.tf
@@ -217,72 +324,74 @@ encryption_config = {
 }
 ```
 
-**KMS Encryption for EBS Volumes**
+#### 2. Encryption at Rest — EBS Volumes
 
-All node root volumes and persistent volumes are encrypted with a separate customer-managed KMS key with automatic rotation enabled. A separate KMS policy allows the Auto Scaling service to use the key when launching new nodes.
+All node root volumes and persistent volumes created from the default StorageClass are encrypted using a dedicated customer-managed KMS key with automatic annual rotation.
 
 ```hcl
-# kms.tf — separate key for EBS
+# kms.tf
 resource "aws_kms_key" "ebs" {
   enable_key_rotation = true
-  ...
 }
 ```
 
-**S3 State Bucket Encryption**
+#### 3. IMDSv2 — Prevent Credential Theft
 
-The Terraform state bucket is encrypted with its own KMS key. State files can contain sensitive values — treat them like secrets.
-
----
-
-#### IMDSv2 — Instance Metadata Service v2
-
-IMDSv2 requires a session token to access the metadata endpoint. This blocks SSRF (Server-Side Request Forgery) attacks where a compromised application fetches `http://169.254.169.254` to steal node IAM credentials.
+IMDSv2 requires an HTTP `PUT` request with a session token before the metadata endpoint responds. This blocks Server-Side Request Forgery (SSRF) attacks where a compromised application fetches `http://169.254.169.254/latest/meta-data/iam/security-credentials/` to steal node IAM credentials.
 
 ```hcl
-# eks.tf — on system nodes
+# Enforced on system nodes (eks.tf) and Karpenter nodes (karpenter.tf)
 metadata_options = {
-  http_endpoint               = "enabled"
-  http_tokens                 = "required"   # enforces IMDSv2
-  http_put_response_hop_limit = 1            # blocks containers from reaching IMDS via hop
+  http_tokens                 = "required"
+  http_put_response_hop_limit = 1   # prevents containers from reaching IMDS via hop
 }
 ```
 
-```yaml
-# karpenter.tf — on all Karpenter nodes
-instanceMetadataOptions:
-  httpTokens: required
-  httpPutResponseHopLimit: 1
-```
+#### 4. IRSA — IAM Roles for Service Accounts
 
----
-
-#### Control Plane Logging
-
-All 5 control plane log types are enabled and sent to CloudWatch. These logs are essential for security auditing, incident response, and debugging cluster-level issues.
-
-| Log type | What it captures |
-|---|---|
-| `api` | All Kubernetes API requests |
-| `audit` | Who did what and when — required for compliance |
-| `authenticator` | IAM authentication attempts |
-| `controllerManager` | Reconciliation loops, scheduling decisions |
-| `scheduler` | Pod placement decisions |
+Every component that needs AWS access (EBS CSI driver, ALB Controller) gets its own dedicated IAM role with least-privilege policies. The role is bound to the component's Kubernetes ServiceAccount via OIDC federation. No long-lived credentials are stored anywhere — pods receive short-lived STS tokens automatically.
 
 ```hcl
-enabled_log_types = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+# irsa.tf
+module "ebs_csi_irsa" {
+  source                = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts"
+  name                  = "${local.name}-ebs-csi"
+  attach_ebs_csi_policy = true
+  oidc_providers = {
+    main = {
+      provider_arn               = module.eks.oidc_provider_arn
+      namespace_service_accounts = ["kube-system:ebs-csi-controller-sa"]
+    }
+  }
+}
 ```
 
----
+#### 5. EKS Access Entries — No aws-auth ConfigMap
 
-#### Network Security
+Cluster access is managed through EKS Access Entries — IAM principals are mapped to cluster permissions via the EKS API. This replaces the `aws-auth` ConfigMap which is error-prone, must be edited carefully with `kubectl`, and can lock you out of the cluster if misconfigured.
 
-**Default-Deny NetworkPolicy**
+```hcl
+enable_cluster_creator_admin_permissions = true
+```
 
-All pod-to-pod traffic is denied by default in `kube-system`. Explicit allow rules are added only for what is needed (CoreDNS DNS queries). Apply this same pattern to every application namespace.
+#### 6. Control Plane Audit Logging
+
+All five control plane log types are enabled and sent to CloudWatch Logs. These are mandatory for security auditing, incident response, and compliance.
+
+| Log Type | What It Records |
+|---|---|
+| `api` | Every request to the Kubernetes API server |
+| `audit` | Who performed what action and when — required for compliance |
+| `authenticator` | All IAM authentication attempts against the cluster |
+| `controllerManager` | Reconciliation loops, garbage collection, replica management |
+| `scheduler` | Pod placement decisions and scheduling failures |
+
+#### 7. Network Policies — Default Deny
+
+All pod traffic is denied by default in `kube-system`. Explicit allow rules are added only for what is required. Apply this pattern to every application namespace.
 
 ```yaml
-# network_policies.tf
+# Deny everything
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -293,138 +402,111 @@ spec:
   policyTypes: [Ingress, Egress]
 ```
 
-**VPC CNI Network Policy Engine**
+VPC CNI network policy enforcement is activated via `ENABLE_NETWORK_POLICY=true`, which runs an eBPF-based policy engine directly in the Linux kernel on every node — no additional CNI plugin required.
 
-`ENABLE_NETWORK_POLICY=true` activates eBPF-based policy enforcement directly in the Linux kernel on each node. This is the AWS-native policy engine — no third-party CNI replacement needed.
+#### 8. Private Worker Nodes
 
-**VPC Flow Logs**
+All worker nodes are placed in private subnets and have no public IP addresses. The only inbound path into the cluster is through an ALB or NLB provisioned by the Load Balancer Controller. Nodes reach the internet for outbound traffic (image pulls, AWS API calls) only through NAT Gateways.
 
-All VPC traffic metadata (source/dest IP, port, accept/drop) is captured to CloudWatch. Used for security analysis, detecting lateral movement, and debugging connectivity issues.
+#### 9. AL2023 Node Operating System
 
-**Security Groups**
+Amazon Linux 2023 provides:
 
-The EKS module creates a cluster security group that allows only the required traffic between the control plane and nodes. An additional rule allows node-to-node traffic for pod communication.
+- **SELinux** enforcing mode by default — mandatory access control at the OS level
+- **Minimal footprint** — fewer installed packages means a smaller attack surface
+- **rpm-ostree** immutable updates — the OS is updated atomically, not package by package, eliminating configuration drift between nodes
+- Regular AWS security patches and CVE fixes
 
----
-
-#### Node Security
-
-**AL2023 AMI**
-
-Amazon Linux 2023 replaces AL2 with:
-- SELinux enforcing mode by default
-- Minimal package footprint (smaller attack surface)
-- rpm-ostree immutable OS updates — no package drift between nodes
-- Regular AWS security patches
-
-**Pinned AMI version**
+#### 10. AMI Version Pinning
 
 ```yaml
-# karpenter.tf — never use @latest in production
 amiSelectorTerms:
-  - alias: al2023@v20260501
+  - alias: al2023@v20260501   # pinned — never @latest in production
 ```
 
-Using `@latest` risks an untested AMI rolling out to production nodes automatically. Test the new AMI version in a dev cluster first, then update the alias in production.
+Using `@latest` risks an untested AMI rolling out to production nodes the moment AWS publishes it. The correct workflow is: validate new AMI in dev → update alias in prod → nodes rotate via `expireAfter`.
 
 ---
 
-### 2. Networking
+### Networking
 
-#### 3-Tier Subnet Design
+#### 1. Three-Tier Subnet Design
 
-| Tier | Subnet | Purpose |
-|---|---|---|
-| Public `/24` | `10.0.48-50.0/24` | NAT Gateways, internet-facing ALBs only |
-| Private `/20` | `10.0.0-32.0/20` | Worker nodes and pod IPs (~4000 IPs per AZ) |
-| Intra `/28` | `10.0.52-54.0/28` | EKS control plane ENIs only — no internet route |
+The VPC uses three subnet tiers, each with a distinct purpose and security posture:
 
-The intra subnets have no route to the internet at all. The control plane ENIs live here — they communicate with the API server internally without ever touching the public internet.
+| Tier | CIDR | Purpose | Internet Route |
+|---|---|---|---|
+| **Public** `/24` | `10.0.48–50.0/24` | NAT Gateways and internet-facing ALBs | Yes — via IGW |
+| **Private** `/20` | `10.0.0–32.0/20` | Worker nodes and pod IPs (~4,000 IPs per AZ) | Outbound only — via NAT GW |
+| **Intra** `/28` | `10.0.52–54.0/28` | EKS control plane ENIs | None |
 
-**Why private subnets for nodes?**
+The intra subnets have no route table entry for the internet. The control plane ENIs live here — they reach the API server entirely within the VPC.
 
-Nodes have no public IP addresses. Inbound traffic is impossible — only the load balancer accepts inbound connections. Nodes reach the internet through NAT Gateways for outbound traffic (pulling images, AWS API calls) but nothing can reach them directly.
-
----
-
-#### One NAT Gateway Per AZ
+#### 2. One NAT Gateway Per Availability Zone
 
 ```hcl
-# vpc.tf
-single_nat_gateway     = false
 one_nat_gateway_per_az = true
 ```
 
-With a single NAT GW, if that AZ fails all nodes lose internet access. With one per AZ, each AZ is self-sufficient. This also eliminates cross-AZ data transfer charges for node egress traffic.
+A single NAT Gateway means that if its AZ goes down, all nodes in other AZs lose internet connectivity. With one per AZ, each AZ is completely self-sufficient. At scale, a single NAT GW also creates a cross-AZ traffic charge of `$0.01/GB` for every node in AZ-2 and AZ-3 routing through AZ-1. One per AZ eliminates this charge entirely.
 
----
+#### 3. VPC CNI Prefix Delegation
 
-#### VPC CNI Prefix Delegation
+Without prefix delegation, the maximum number of pod IPs on an `m5.large` is:
 
-```hcl
-ENABLE_PREFIX_DELEGATION = "true"
-WARM_PREFIX_TARGET       = "1"
+```
+3 ENIs × 10 secondary IPs = 29 pod IPs
 ```
 
-Without prefix delegation, each ENI secondary IP provides one pod IP. A `m5.large` has 3 ENIs × 10 IPs = 29 pod IPs maximum.
+With prefix delegation enabled (`ENABLE_PREFIX_DELEGATION=true`), each ENI receives a `/28` prefix:
 
-With prefix delegation, each ENI gets a `/28` prefix = 16 IPs. The same `m5.large` supports 3 ENIs × 10 prefixes × 16 = 480 pod IPs. This prevents IP exhaustion in large clusters.
+```
+3 ENIs × 10 prefixes × 16 IPs = 480 pod IPs
+```
 
----
+This prevents IP address exhaustion in dense clusters and is the AWS-recommended configuration for all production EKS clusters.
 
-#### Subnet Tagging for Auto-Discovery
+#### 4. Subnet Tagging for Auto-Discovery
+
+The ALB Controller and Karpenter discover their target subnets by tag — no hardcoded subnet IDs anywhere.
 
 ```hcl
-# vpc.tf — ALB controller discovers subnets by these tags
 public_subnet_tags = {
-  "kubernetes.io/role/elb"  = 1   # internet-facing ALBs
+  "kubernetes.io/role/elb"  = 1   # ALB controller places internet-facing ALBs here
   "karpenter.sh/discovery"  = local.name
 }
 private_subnet_tags = {
-  "kubernetes.io/role/internal-elb" = 1   # internal ALBs
+  "kubernetes.io/role/internal-elb" = 1   # ALB controller places internal ALBs here
   "karpenter.sh/discovery"          = local.name
 }
 ```
 
-Without these tags, the ALB controller cannot find which subnets to place load balancers in. Karpenter uses the same tags to find which subnets to launch nodes into.
+#### 5. VPC Flow Logs
+
+All VPC traffic metadata is captured to CloudWatch Logs. Flow logs record source and destination IP, port, protocol, and accept/drop status. Used for security analysis, detecting lateral movement, and debugging connectivity issues.
 
 ---
 
-### 3. Reliability
+### Reliability
 
-#### Multi-AZ Everything
+#### 1. Multi-AZ Control Plane
 
-- EKS control plane: AWS spreads it across 3 AZs automatically
-- System node group: spans all 3 private subnets
-- Karpenter NodePool: restricted to the 3 known AZs
-- CoreDNS autoscaler: `preventSinglePointOfFailure: true`
+AWS automatically runs the EKS API server and etcd across all three Availability Zones. A full AZ failure does not affect the control plane. This is managed entirely by AWS — there is nothing to configure.
 
-If an entire AZ goes down, the cluster continues operating on the remaining 2 AZs.
+#### 2. Multi-AZ Worker Nodes
 
----
+The system node group is configured across all three private subnets. Karpenter's NodePool restricts provisioning to the three known AZs and spreads nodes using topology spread constraints. If one AZ fails, workloads reschedule onto nodes in the remaining two AZs.
 
-#### System Node Group — Dedicated Infrastructure Nodes
+#### 3. Dedicated System Nodes — Taint-Based Isolation
 
-The system node group runs cluster infrastructure (Karpenter, CoreDNS, ALB controller) on dedicated ON_DEMAND nodes that are never managed by Karpenter.
+The system node group is tainted with `CriticalAddonsOnly=true:NoSchedule`. This prevents application pods from landing on system nodes — application pods must explicitly tolerate the taint to schedule there (none should).
 
-```hcl
-taints = {
-  CriticalAddonsOnly = {
-    key    = "CriticalAddonsOnly"
-    value  = "true"
-    effect = "NO_SCHEDULE"
-  }
-}
-```
+This ensures:
+- Karpenter is never resource-starved by application workloads
+- CoreDNS always has capacity to serve DNS queries
+- System nodes are `ON_DEMAND` — they are never reclaimed by AWS as Spot instances
 
-The taint prevents application pods from landing on system nodes. Karpenter and CoreDNS have tolerations for this taint. This means:
-- Application pods can never starve cluster infrastructure of resources
-- Karpenter is always running even when the cluster has zero application nodes
-- System nodes are ON_DEMAND — they are never interrupted
-
----
-
-#### CoreDNS Lameduck Duration
+#### 4. CoreDNS — Lameduck Duration
 
 ```
 health {
@@ -432,14 +514,13 @@ health {
 }
 ```
 
-When a CoreDNS pod begins shutting down, it waits 5 seconds before stopping. During this window it continues serving DNS responses. This prevents DNS failures when Karpenter rapidly terminates nodes — pods that had the terminating CoreDNS pod in their resolver cache can still get responses for 5 seconds while switching to a healthy replica.
+When a CoreDNS pod begins shutting down — triggered by Karpenter draining a node — it waits 5 seconds before stopping its DNS listener. During this window, pods that have the terminating CoreDNS pod cached in their resolver continue to receive responses. This prevents DNS query failures during rapid node turnover.
 
----
+#### 5. CoreDNS — Cluster-Proportional Autoscaling
 
-#### CoreDNS Cluster-Proportional Autoscaler
+CoreDNS replicas scale automatically with the size of the cluster:
 
 ```yaml
-# network_policies.tf
 linear: |
   {
     "coresPerReplica": 256,
@@ -449,35 +530,29 @@ linear: |
   }
 ```
 
-CoreDNS scales automatically as the cluster grows — 1 replica per 8 nodes, minimum 2 replicas always. Without this, a large cluster has 2 CoreDNS pods serving thousands of nodes and DNS becomes a bottleneck.
+Without autoscaling, a 100-node cluster still has 2 CoreDNS pods — DNS becomes a bottleneck. With proportional autoscaling, CoreDNS grows with the cluster and is always spread across multiple nodes for high availability.
 
----
+#### 6. Node Monitoring Agent
 
-#### Node Monitoring Agent
+The Node Monitoring Agent runs as a DaemonSet on every node. It detects fatal conditions such as kernel panics, kubelet failures, OOM events, and disk pressure. These are surfaced as Kubernetes Node conditions. Karpenter reads these conditions and automatically provisions a replacement node without manual intervention.
+
+#### 7. EBS Volume AZ Binding
 
 ```hcl
-eks-node-monitoring-agent = { most_recent = true }
+volume_binding_mode = "WaitForFirstConsumer"
 ```
 
-The Node Monitoring Agent runs as a DaemonSet on every node. It detects fatal conditions (kernel panics, kubelet failures, disk pressure) and reports them as Kubernetes Node conditions. Karpenter reads these conditions and automatically replaces affected nodes without manual intervention.
+EBS volumes are AZ-specific — a volume in `us-east-1a` cannot be attached to a node in `us-east-1b`. `WaitForFirstConsumer` delays volume creation until a pod is scheduled on a node. The volume is then created in the same AZ as the node. Without this setting, a volume might be created in the wrong AZ and the pod will stay in `Pending` indefinitely.
 
----
+#### 8. Pod Disruption Budgets
 
-#### Pod Disruption Budgets
+Karpenter itself has a PDB ensuring at least one replica is always available during node consolidation or rolling updates. Apply the same pattern to all stateful application workloads:
 
-Karpenter itself has a PDB ensuring at least 1 replica is always available during node consolidation or rolling updates:
-
-```yaml
-podDisruptionBudget:
-  minAvailable: 1
-```
-
-Apply PDBs to your own applications too:
 ```yaml
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: my-app
+  name: my-app-pdb
 spec:
   minAvailable: 1
   selector:
@@ -487,116 +562,119 @@ spec:
 
 ---
 
-#### EBS Volume AZ Binding
-
-```hcl
-volume_binding_mode = "WaitForFirstConsumer"
-```
-
-EBS volumes can only be attached to nodes in the same AZ. `WaitForFirstConsumer` delays volume creation until a pod is scheduled — the volume is then created in the same AZ as the node. Without this, a volume might be created in AZ-1 but the pod schedules in AZ-2, causing it to stay in `Pending` forever.
-
----
-
-### 4. Karpenter — Node Autoscaling
+### Karpenter — Node Autoscaling
 
 #### How Karpenter Works
 
-1. A pod is created with no node to run on (insufficient resources)
-2. Karpenter reads the pod's resource requests, node selectors, tolerations, and affinity rules
-3. Karpenter picks the cheapest instance type that fits the pod
-4. Karpenter launches the EC2 instance and registers it with the cluster
-5. The pod schedules onto the new node
-6. When the node is empty or underutilised, Karpenter terminates it
+1. A pod is created but cannot be scheduled — no node has sufficient resources
+2. Karpenter reads the pod's resource requests, node selectors, tolerations, topology spread constraints, and affinity rules
+3. Karpenter selects the most cost-effective EC2 instance type that satisfies all constraints
+4. Karpenter launches the instance via EC2 Fleet and registers it directly with the cluster
+5. The pod schedules onto the new node — typically within 60 seconds
+6. When a node is empty or its pods can be packed onto fewer nodes, Karpenter drains and terminates it
 
-This happens in seconds — much faster than the Cluster Autoscaler which works through Auto Scaling Groups.
-
----
+This is fundamentally faster and more flexible than the Cluster Autoscaler, which works indirectly through Auto Scaling Groups and requires pre-defined node group configurations.
 
 #### EC2NodeClass — Node Configuration
 
-```yaml
-# karpenter.tf
-amiSelectorTerms:
-  - alias: al2023@v20260501   # pinned — never @latest in prod
-role: <karpenter-node-role>
-subnetSelectorTerms:
-  - tags:
-      karpenter.sh/discovery: prod-eks
-securityGroupSelectorTerms:
-  - tags:
-      karpenter.sh/discovery: prod-eks
-instanceMetadataOptions:
-  httpTokens: required          # IMDSv2 enforced
-```
-
-The NodeClass describes the AWS-level properties of nodes. The subnet and security group selectors use tags to auto-discover the right resources — no hardcoded IDs that break across environments.
-
----
-
-#### NodePool — Scheduling Constraints
+The `EC2NodeClass` defines the AWS-level properties applied to every node Karpenter provisions:
 
 ```yaml
-# karpenter.tf
-requirements:
-  - key: karpenter.sh/capacity-type
-    operator: In
-    values: ["spot", "on-demand"]    # Spot preferred, On-Demand fallback
-  - key: karpenter.k8s.aws/instance-category
-    operator: In
-    values: ["c", "m", "r"]          # compute, general, memory families
-  - key: karpenter.k8s.aws/instance-generation
-    operator: Gt
-    values: ["2"]                    # gen3 and newer only
-expireAfter: 720h                    # 30-day node rotation
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: default
+spec:
+  amiSelectorTerms:
+    - alias: al2023@v20260501     # pinned AMI — never @latest in production
+  role: <karpenter-node-iam-role>
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: prod-eks   # auto-discovers private subnets by tag
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: prod-eks   # auto-discovers node security group by tag
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 50Gi
+        volumeType: gp3
+        encrypted: true
+  instanceMetadataOptions:
+    httpTokens: required             # IMDSv2 enforced on all Karpenter nodes
+    httpPutResponseHopLimit: 1
 ```
 
-**Why broad instance selection matters for Spot**
+#### NodePool — Scheduling Constraints and Limits
 
-Spot instances come from EC2 capacity pools. Each instance type in each AZ is a separate pool. If you restrict to only 2–3 instance types, all your Spot nodes might be in the same pool — one Spot reclamation event takes down all your nodes at once. With many eligible instance types across 3 AZs, the probability of simultaneous interruption drops dramatically.
+The `NodePool` defines which types of instances Karpenter may provision and the hard limits on total cluster size:
 
----
+```yaml
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  template:
+    spec:
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]      # Spot preferred, On-Demand fallback
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: ["c", "m", "r"]            # compute / general / memory families
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gt
+          values: ["2"]                      # generation 3 and newer only
+      expireAfter: 720h                      # force node replacement every 30 days
+  limits:
+    cpu: 1000
+    memory: 2000Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 5m
+    budgets:
+      - nodes: "10%"                         # max 10% of nodes disrupted simultaneously
+```
+
+#### Why Broad Instance Selection Matters for Spot
+
+Each EC2 instance type in each Availability Zone is a separate Spot capacity pool. When AWS reclaims Spot capacity, it reclaims from a specific pool. By allowing many instance types across three AZs, Karpenter spreads nodes across many pools. The probability that all pools are reclaimed simultaneously is extremely low.
+
+Restricting to only 2–3 instance types means all Spot nodes could be in the same pool — a single reclamation event could take down all your application nodes at once.
 
 #### Spot Interruption Handling
 
 ```hcl
-# karpenter.tf
 settings = {
   interruptionQueue = module.karpenter.queue_name
 }
 ```
 
-AWS sends a 2-minute warning before reclaiming a Spot instance. Karpenter receives this via an SQS queue, immediately taints the node, drains its pods, and starts a replacement node — all before the instance is terminated. Without this, pods are killed without warning.
+AWS sends a 2-minute warning before reclaiming a Spot instance. Karpenter receives this notification via an SQS queue, immediately taints the node `NoSchedule`, drains all pods, and launches a replacement node — all before the instance is terminated. Pods are moved gracefully rather than killed abruptly.
 
----
-
-#### Node Expiry and AMI Rotation
+#### Node Expiry — Automatic AMI Rotation
 
 ```yaml
 expireAfter: 720h
 ```
 
-Every node is replaced after 30 days regardless of utilisation. This ensures:
-- Nodes always run a recent, patched AMI
-- No long-lived nodes accumulate configuration drift
-- AMI updates are gradual and automatic — no big-bang replacement events
+Every Karpenter-managed node is replaced after 30 days regardless of utilisation. This ensures all nodes regularly run a recently patched AMI without requiring any manual intervention. Node replacement is gradual — Karpenter drains one node at a time respecting Pod Disruption Budgets.
 
-To update the AMI: test the new alias in dev, update `al2023@v20260501` in `karpenter.tf`, then `terraform apply`. Old nodes expire and are replaced over the next 30 days.
+**AMI update workflow:**
 
----
-
-#### Consolidation
-
-```yaml
-disruption:
-  consolidationPolicy: WhenEmptyOrUnderutilized
-  consolidateAfter: 5m
-  budgets:
-    - nodes: "10%"
+```
+1. New AMI released by AWS
+2. Test new AMI alias in dev cluster
+3. Update alias in karpenter.tf: al2023@v20260601
+4. terraform apply
+5. Over the next 30 days, nodes expire and Karpenter recreates them with the new AMI
 ```
 
-Karpenter monitors node utilisation. When pods can be rescheduled onto fewer nodes, Karpenter moves them and terminates the now-empty nodes. The 10% budget means no more than 10% of nodes are disrupted simultaneously — important for production availability.
+#### Consolidation — Bin Packing
 
----
+When cluster demand decreases, Karpenter identifies nodes whose pods can be rescheduled onto fewer nodes. It drains those nodes and terminates them, reducing cost automatically. The `10%` budget prevents more than 10% of nodes from being disrupted at the same time.
 
 #### Resource Limits — Cost Guard Rail
 
@@ -606,58 +684,61 @@ limits:
   memory: 2000Gi
 ```
 
-Karpenter stops provisioning new nodes when these limits are hit. Without limits, a misconfigured deployment with 10,000 replicas would provision thousands of nodes and generate an enormous AWS bill. Set a CloudWatch billing alarm alongside this.
+Karpenter stops provisioning new nodes when these limits are reached. Without limits, a misconfigured deployment requesting thousands of replicas would provision hundreds of nodes and generate an enormous unexpected bill. Always pair resource limits with a CloudWatch billing alarm.
 
 ---
 
-### 5. Storage
+### Storage
 
-#### gp3 Default StorageClass
+#### Default StorageClass — gp3
 
-```hcl
-# storage.tf
-storage_provisioner = "ebs.csi.aws.com"
-parameters = {
-  type      = "gp3"
-  encrypted = "true"
-  kmsKeyId  = aws_kms_key.ebs.arn
-}
-```
+All `PersistentVolumeClaims` that do not specify a StorageClass use gp3 by default. The legacy gp2 StorageClass is demoted (its `is-default-class` annotation is set to `false`).
 
-gp3 is 20% cheaper than gp2 with better baseline performance (3000 IOPS, 125 MB/s included) and independent IOPS/throughput scaling. All volumes are encrypted by default with the EBS KMS key.
-
-**`gp2` is demoted** — `storage.tf` removes its default annotation so new PVCs always use gp3.
-
-#### Adding More Storage Later
-
-| Workload | Solution | When to use |
+| | gp2 | gp3 |
 |---|---|---|
-| Multiple pods reading same files | EFS (NFS) | Shared config, media, ML datasets |
-| High-IOPS database | EBS io2 | PostgreSQL, MySQL needing >3000 IOPS |
-| Cold archive data | EBS sc1 | Cheap large volumes, infrequent access |
-| Reading S3 in pods | Mountpoint for S3 | Model weights, large datasets |
-| ML training / HPC | FSx for Lustre | Hundreds of GB/s parallel throughput |
+| Price | $0.10/GB/month | $0.08/GB/month |
+| Baseline IOPS | 3 IOPS/GB (min 100) | 3,000 always |
+| Baseline throughput | 128–250 MB/s | 125 MB/s |
+| Independent scaling | No | Yes — IOPS and throughput separately |
+
+All volumes are encrypted by default using the EBS KMS key.
+
+#### Adding More Storage
+
+| Workload Type | Recommended Solution | Characteristics |
+|---|---|---|
+| Multiple pods reading the same files | **Amazon EFS** | ReadWriteMany, NFS protocol, elastic capacity |
+| High-performance database | **EBS io2** | Up to 64,000 IOPS, consistent low latency |
+| Cold archive data | **EBS sc1** | $0.015/GB/month — lowest cost block storage |
+| Large datasets, ML model weights | **Mountpoint for S3** | Mount S3 buckets as filesystem paths in pods |
+| ML training, HPC, batch jobs | **FSx for Lustre** | Hundreds of GB/s parallel throughput |
 
 ---
 
-### 6. Cost Optimisation
+### Cost Optimisation
 
 #### Spot Instances for Application Workloads
 
-Karpenter defaults to Spot with On-Demand fallback. Spot instances are typically 60–90% cheaper than On-Demand. The Spot interruption handler ensures graceful draining so pods are not killed abruptly.
+Karpenter defaults to Spot instances with automatic On-Demand fallback. Spot instances are typically **60–90% cheaper** than On-Demand.
 
-Never run these on Spot:
-- Karpenter itself (runs on system ON_DEMAND nodes)
-- CoreDNS (tolerated on system nodes)
-- Stateful workloads that cannot be safely interrupted
+Spot instances are appropriate for:
+- Stateless web services and APIs
+- Background processing and batch jobs
+- Any workload that can be safely restarted within 2 minutes
 
----
+Spot instances are **not** appropriate for:
+- Karpenter itself — runs on system ON_DEMAND nodes
+- CoreDNS — runs on system ON_DEMAND nodes
+- Databases and other stateful workloads that cannot tolerate interruption
 
-#### NAT Gateway — One Per AZ Not One Total
+#### One NAT Gateway Per AZ vs One Total
 
-A single NAT Gateway saves ~$65/month but routes all outbound traffic from AZ-2 and AZ-3 through AZ-1. AWS charges $0.01/GB for cross-AZ traffic. At any significant scale, the cross-AZ data transfer cost exceeds the saving. Three NAT Gateways keep traffic within each AZ.
+| Configuration | Monthly cost | Risk |
+|---|---|---|
+| 1 NAT Gateway total | ~$32 | Cross-AZ traffic charges; single point of failure |
+| 1 per AZ (used here) | ~$97 | No cross-AZ charges; AZ-resilient |
 
----
+At any significant egress volume, the cross-AZ data transfer cost (`$0.01/GB`) of routing all AZ-2 and AZ-3 traffic through a single NAT GW in AZ-1 exceeds the saving. One per AZ is the correct production configuration.
 
 #### S3 Native State Locking
 
@@ -665,180 +746,209 @@ A single NAT Gateway saves ~$65/month but routes all outbound traffic from AZ-2 
 use_lockfile = true
 ```
 
-Terraform 1.10+ writes a `.tflock` file in S3 instead of using a DynamoDB lock table. Eliminates the DynamoDB table cost (~$1–5/month small, more at scale) and one fewer resource to manage.
+Terraform 1.10+ uses a `.tflock` file in S3 instead of a DynamoDB table for state locking. Eliminates the DynamoDB table entirely — one fewer resource to manage, and the associated cost.
 
----
+#### Karpenter Consolidation
 
-#### Monitor Costs with Karpenter Limits
+Karpenter's `WhenEmptyOrUnderutilized` consolidation policy automatically moves pods off underutilised nodes and terminates them. During low-traffic periods, the cluster shrinks automatically without any manual intervention.
 
-Set a CloudWatch billing alarm when you deploy — Karpenter can scale fast and you want to know before your bill surprises you:
+#### Billing Alarm
+
+Set a CloudWatch billing alarm before deploying — Karpenter can scale fast:
 
 ```bash
 aws cloudwatch put-metric-alarm \
-  --alarm-name eks-spend-alert \
+  --alarm-name "eks-monthly-spend" \
   --metric-name EstimatedCharges \
   --namespace AWS/Billing \
   --statistic Maximum \
   --period 86400 \
   --threshold 500 \
   --comparison-operator GreaterThanThreshold \
-  --alarm-actions <your-sns-arn>
+  --alarm-actions <your-sns-topic-arn>
 ```
 
 ---
 
-### 7. Cluster Upgrades
+### Cluster Upgrades
 
-#### Kubernetes Version — Stay on Standard Support
+#### Kubernetes Version Support
 
-```hcl
-# variables.tf
-default = "1.35"
-```
+Amazon EKS supports each Kubernetes minor version for 14 months (standard support) followed by 12 months of paid extended support. Always run a version in standard support to avoid the extended support surcharge.
 
-| Version | Support | Extra cost |
+| Version | Status | Ends Standard Support |
 |---|---|---|
-| 1.35, 1.34, 1.33 | Standard (free) | No |
-| 1.32, 1.31, 1.30 | Extended | Yes — per cluster/hour surcharge |
+| 1.35 | Standard | March 2027 |
+| 1.34 | Standard | December 2026 |
+| 1.33 | Standard | July 2026 |
+| 1.32 | Extended (extra cost) | March 2026 |
 
-Always run a standard-support version. Check the calendar:
+Check current versions:
 
 ```bash
 aws eks describe-cluster-versions \
-  --query 'clusterVersions[*].{Version:clusterVersion,Status:status,EndStandard:endOfStandardSupportDate}'
+  --query 'clusterVersions[*].{Version:clusterVersion,Status:status,EndStandard:endOfStandardSupportDate}' \
+  --output table
 ```
 
----
+#### Upgrading the Kubernetes Version
 
-#### How to Upgrade the Cluster
-
-1. **Check add-on compatibility** — AWS lists compatible add-on versions per Kubernetes version
-2. **Update `cluster_version`** in `terraform.tfvars`
-3. **Run `terraform apply`** — EKS upgrades the control plane (10–15 min, zero downtime)
-4. **Update system node group AMI** — change `ami_type` if needed, drain and replace nodes
-5. **Karpenter nodes rotate automatically** via `expireAfter: 720h` — new nodes use the new Kubernetes version
-
-Never skip a minor version. Go 1.33 → 1.34 → 1.35, not 1.33 → 1.35 directly.
-
----
-
-#### How to Upgrade Karpenter
+> Never skip a minor version. Upgrade 1.33 → 1.34 → 1.35, not 1.33 → 1.35.
 
 ```bash
-# 1. Check latest version
-open https://github.com/aws/karpenter-provider-aws/releases/latest
-
-# 2. Update the variable
+# 1. Update the version variable
 # terraform.tfvars
-karpenter_version = "1.x.x"
+cluster_version = "1.36"
 
-# 3. Apply
+# 2. Apply — EKS upgrades the control plane (~15 min, zero downtime)
+terraform apply
+
+# 3. Update the system node group AMI type if needed
+# eks.tf: ami_type = "AL2023_x86_64_STANDARD"
+# Then: terraform apply — nodes are drained and replaced rolling
+
+# 4. Karpenter nodes rotate automatically over 30 days via expireAfter
+# To force immediate rotation: kubectl delete node <name>
+```
+
+#### Upgrading Karpenter
+
+```bash
+# 1. Check for new releases
+# https://github.com/aws/karpenter-provider-aws/releases
+
+# 2. Update the version
+# terraform.tfvars
+karpenter_version = "1.13.0"
+
+# 3. Apply — Helm performs a rolling upgrade
 terraform apply
 ```
 
-Karpenter upgrades are rolling — the old pods are replaced one at a time. The PDB ensures at least 1 replica is always running.
-
----
-
-#### How to Rotate Node AMIs
+#### Rotating Node AMIs
 
 ```bash
-# 1. Find the latest AL2023 AMI alias for your cluster version
+# Find available AL2023 AMI aliases for your cluster version
 aws ssm get-parameters-by-path \
   --path /aws/service/eks/optimized-ami/1.35/amazon-linux-2023/ \
-  --query 'Parameters[*].Name' --output table
+  --query 'Parameters[*].Name' \
+  --output table
 
-# 2. Update karpenter.tf
-#    amiSelectorTerms:
-#      - alias: al2023@v20260601   ← new version
+# Update karpenter.tf
+#   amiSelectorTerms:
+#     - alias: al2023@v20260601
 
-# 3. Apply
+# Apply — new nodes use the new AMI, old nodes expire over 30 days
 terraform apply
-
-# Nodes rotate automatically over 30 days via expireAfter.
-# To force immediate rotation: delete nodes manually and Karpenter recreates them.
 ```
 
 ---
 
-### 8. Day-2 Operations
+## Day-2 Operations
 
-#### Check Cluster Health
+### Verify Cluster Health
 
 ```bash
 # All nodes ready
-kubectl get nodes
+kubectl get nodes -o wide
 
-# All system pods running
+# System pods running
 kubectl get pods -n kube-system
 
-# Karpenter logs
-kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter --tail=50
+# Karpenter controller logs
+kubectl logs -n karpenter \
+  -l app.kubernetes.io/name=karpenter \
+  --tail=100 --follow
 
-# Karpenter node provisioning activity
-kubectl get events --field-selector reason=ProvisionedNodes -A
+# Recent Karpenter provisioning events
+kubectl get events -A --field-selector reason=ProvisionedNodes
 ```
 
-#### Check Karpenter Scaling
+### Inspect Karpenter Scaling
 
 ```bash
-# Current NodePools and their limits
-kubectl get nodepools
+# NodePools and their current usage vs limits
+kubectl get nodepools -o wide
 
-# Nodes Karpenter is managing
+# All nodes Karpenter is managing
 kubectl get nodeclaims
 
-# Why a pod is unschedulable
-kubectl describe pod <pending-pod>
+# Why a pod is not scheduling
+kubectl describe pod <pending-pod-name> -n <namespace>
+
+# Karpenter's view of pending pods
+kubectl get pods -A --field-selector status.phase=Pending
 ```
 
-#### Check Add-on Versions
+### Check Add-on Versions
 
 ```bash
-# See installed add-on versions vs latest available
-aws eks describe-addon-versions --cluster-name prod-eks \
-  --query 'addons[*].{Name:addonName,Current:addonVersions[0].addonVersion}'
+# Compare installed vs latest available
+aws eks describe-addon-versions \
+  --kubernetes-version 1.35 \
+  --query 'addons[*].{Name:addonName,Latest:addonVersions[0].addonVersion}'
 ```
 
-#### Rotate kubeconfig
+### Refresh kubeconfig
 
 ```bash
-# Refresh your local kubeconfig
 aws eks update-kubeconfig --region us-east-1 --name prod-eks
+```
+
+### Access Node via Session Manager
+
+No SSH key or bastion host needed — nodes have SSM agent installed:
+
+```bash
+# Find the node's EC2 instance ID
+kubectl get node <node-name> -o jsonpath='{.spec.providerID}' | cut -d'/' -f5
+
+# Start a session
+aws ssm start-session --target <instance-id>
 ```
 
 ---
 
 ## Adding Storage Later
 
-| Need | Action |
-|---|---|
-| Shared files across pods | Add EFS CSI driver + `aws_efs_file_system` to a new `efs.tf` |
-| High IOPS databases | Add `io2` StorageClass to `storage.tf` |
-| S3 as filesystem in pods | Add Mountpoint for S3 CSI driver |
-| ML/HPC parallel storage | Add FSx for Lustre |
+All storage solutions are addable by writing a new `.tf` file and running `terraform apply`. No cluster rebuild required.
+
+| Need | File to create | Resources |
+|---|---|---|
+| Shared files (ReadWriteMany) | `efs.tf` | `aws_efs_file_system`, mount targets, EFS CSI addon |
+| High-IOPS database volumes | `storage.tf` (add to existing) | `kubernetes_storage_class_v1` with `io2` type |
+| S3 buckets as pod filesystem | `s3_csi.tf` | Mountpoint for S3 CSI driver addon, IRSA role |
+| ML / HPC parallel storage | `fsx.tf` | `aws_fsx_lustre_file_system`, FSx CSI addon |
 
 ---
 
 ## Estimated Cost
 
-| Resource | $/month |
-|---|---|
-| EKS control plane | ~$72 |
-| 2× m5.large system nodes (ON_DEMAND) | ~$138 |
-| 3× NAT Gateway | ~$97 |
-| EBS volumes + KMS + CloudWatch | ~$15 |
-| **Minimum total (no app workloads)** | **~$322** |
+The following are minimum costs with no application workloads running.
 
-Application node costs scale with traffic. Spot instances reduce app node costs by 60–90%.
+| Resource | Quantity | $/month |
+|---|---|---|
+| EKS control plane | 1 cluster | ~$72 |
+| m5.large system nodes | 2 × ON_DEMAND | ~$138 |
+| NAT Gateway | 3 × (one per AZ) | ~$97 |
+| EBS root volumes (50GB gp3) | 2 nodes | ~$8 |
+| KMS keys | 2 keys | ~$2 |
+| CloudWatch Logs (flow logs + control plane) | Variable | ~$10 |
+| **Minimum total** | | **~$327/month** |
+
+Application node costs are additional and proportional to traffic. Karpenter Spot instances reduce application node costs by 60–90% compared to On-Demand.
 
 ---
 
 ## References
 
-- [AWS EKS Best Practices Guide](https://docs.aws.amazon.com/eks/latest/best-practices/introduction.html)
-- [Karpenter Documentation](https://karpenter.sh/docs/)
-- [EKS Add-ons](https://docs.aws.amazon.com/eks/latest/userguide/eks-add-ons.html)
-- [VPC CNI](https://github.com/aws/amazon-vpc-cni-k8s)
-- [AWS Load Balancer Controller](https://kubernetes-sigs.github.io/aws-load-balancer-controller/)
-- [EKS Kubernetes Version Lifecycle](https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions.html)
+| Resource | URL |
+|---|---|
+| AWS EKS Best Practices Guide | https://docs.aws.amazon.com/eks/latest/best-practices/introduction.html |
+| Karpenter Documentation | https://karpenter.sh/docs/ |
+| EKS Kubernetes Version Lifecycle | https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions.html |
+| EKS Managed Add-ons | https://docs.aws.amazon.com/eks/latest/userguide/eks-add-ons.html |
+| VPC CNI — Prefix Delegation | https://docs.aws.amazon.com/eks/latest/userguide/cni-increase-ip-addresses.html |
+| AWS Load Balancer Controller | https://kubernetes-sigs.github.io/aws-load-balancer-controller/ |
+| Terraform AWS EKS Module | https://registry.terraform.io/modules/terraform-aws-modules/eks/aws/latest |
+| Terraform AWS VPC Module | https://registry.terraform.io/modules/terraform-aws-modules/vpc/aws/latest |
