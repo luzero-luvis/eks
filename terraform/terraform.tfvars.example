@@ -1,4 +1,4 @@
-aws_region   = "us-east-1"
+aws_region   = "ap-south-1"
 cluster_name = "prod-eks"
 project      = "luvis"
 environment  = "prod"
@@ -6,6 +6,24 @@ owner        = "platform"
 
 cluster_version = "1.35"
 vpc_cidr        = "10.0.0.0/16"
+
+# One NAT gateway (~$33/mo) instead of one per AZ (~$97/mo). Set to false when an
+# AZ outage must not stop egress, or when NAT egress exceeds ~4-5 TB/month.
+single_nat_gateway = true
+
+# S3 gateway endpoint is free — keeps ECR image layer pulls off the NAT gateway.
+enable_s3_endpoint = true
+
+# Interface endpoints cost ~$22/mo per service across 3 AZs. Uncomment to stop
+# image pulls and IRSA depending on the single NAT gateway's AZ.
+# interface_endpoints = ["ecr.api", "ecr.dkr", "sts"]
+
+# API Gateway HTTP API -> VPC Link -> internal NLB in front of cluster workloads.
+# Enable, apply, then apply the TargetGroupBinding printed by
+# `terraform output api_gateway_target_group_binding`.
+enable_api_gateway            = false
+api_gateway_target_port       = 8080
+api_gateway_health_check_path = "/healthz"
 
 # Lock down to your VPN/office CIDR in production!
 cluster_endpoint_public_access_cidrs = ["203.0.113.0/24"]

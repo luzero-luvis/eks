@@ -19,7 +19,7 @@ resource "kubectl_manifest" "default_deny_kube_system" {
         - Egress
   YAML
 
-  depends_on = [module.eks]
+  depends_on = [module.eks_addons]
 }
 
 # Allow CoreDNS to answer DNS queries from any pod in any namespace
@@ -113,7 +113,7 @@ resource "kubectl_manifest" "coredns_autoscaler" {
                   memory: 70Mi
   YAML
 
-  depends_on = [module.eks]
+  depends_on = [module.eks_addons]
 }
 
 resource "kubectl_manifest" "coredns_autoscaler_sa" {
@@ -125,7 +125,7 @@ resource "kubectl_manifest" "coredns_autoscaler_sa" {
       namespace: kube-system
   YAML
 
-  depends_on = [module.eks]
+  depends_on = [module.eks_addons]
 }
 
 resource "kubectl_manifest" "coredns_autoscaler_clusterrole" {
@@ -149,7 +149,7 @@ resource "kubectl_manifest" "coredns_autoscaler_clusterrole" {
         verbs: ["get", "create", "update"]
   YAML
 
-  depends_on = [module.eks]
+  depends_on = [module.eks_addons]
 }
 
 resource "kubectl_manifest" "coredns_autoscaler_clusterrolebinding" {
@@ -190,5 +190,5 @@ resource "kubectl_manifest" "coredns_autoscaler_configmap" {
         }
   YAML
 
-  depends_on = [module.eks]
+  depends_on = [module.eks_addons]
 }

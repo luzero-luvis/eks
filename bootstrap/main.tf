@@ -1,19 +1,3 @@
-# ── KMS key for state bucket encryption ──────────────────────────────────────
-resource "aws_kms_key" "state" {
-  description             = "Terraform state bucket encryption"
-  deletion_window_in_days = 7
-  enable_key_rotation     = true
-
-  tags = {
-    Name = "${var.project}-terraform-state"
-  }
-}
-
-resource "aws_kms_alias" "state" {
-  name          = "alias/${var.project}/terraform-state"
-  target_key_id = aws_kms_key.state.key_id
-}
-
 # ── S3 bucket ─────────────────────────────────────────────────────────────────
 resource "aws_s3_bucket" "state" {
   bucket = var.bucket_name
@@ -35,11 +19,10 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "state" {
   bucket = aws_s3_bucket.state.id
 
   rule {
+    # SSE-S3 (AES256) — S3-managed keys, no customer-managed KMS key
     apply_server_side_encryption_by_default {
-      sse_algorithm     = "aws:kms"
-      kms_master_key_id = aws_kms_key.state.arn
+      sse_algorithm = "AES256"
     }
-    bucket_key_enabled = true
   }
 }
 

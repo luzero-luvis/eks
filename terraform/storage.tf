@@ -15,11 +15,10 @@ resource "kubernetes_storage_class_v1" "gp3" {
   parameters = {
     type      = "gp3"
     encrypted = "true"
-    kmsKeyId  = aws_kms_key.ebs.arn
     fsType    = "ext4"
   }
 
-  depends_on = [module.eks]
+  depends_on = [module.eks_addons]
 }
 
 # Remove the legacy gp2 default StorageClass that EKS creates automatically
@@ -34,5 +33,5 @@ resource "kubernetes_annotations" "gp2_not_default" {
   }
   force = true
 
-  depends_on = [module.eks]
+  depends_on = [module.eks_addons]
 }

@@ -8,11 +8,6 @@ output "state_bucket_arn" {
   value       = aws_s3_bucket.state.arn
 }
 
-output "kms_key_arn" {
-  description = "KMS key ARN used to encrypt state"
-  value       = aws_kms_key.state.arn
-}
-
 output "backend_config" {
   description = "Paste this into terraform/backend.tf"
   value       = <<-EOT
@@ -22,7 +17,6 @@ output "backend_config" {
         key          = "prod/eks/terraform.tfstate"
         region       = "${var.aws_region}"
         encrypt      = true
-        kms_key_id   = "${aws_kms_key.state.arn}"
         use_lockfile = true
       }
     }

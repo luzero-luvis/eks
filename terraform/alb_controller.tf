@@ -10,7 +10,7 @@ resource "helm_release" "alb_controller" {
 
   set {
     name  = "clusterName"
-    value = module.eks.cluster_name
+    value = module.eks_control_plane.cluster_name
   }
 
   set {
@@ -20,7 +20,7 @@ resource "helm_release" "alb_controller" {
 
   set {
     name  = "vpcId"
-    value = module.vpc.vpc_id
+    value = module.network.vpc_id
   }
 
   set {
@@ -59,5 +59,5 @@ resource "helm_release" "alb_controller" {
     value = "system"
   }
 
-  depends_on = [module.eks, module.alb_controller_irsa]
+  depends_on = [module.eks_addons, module.alb_controller_irsa]
 }

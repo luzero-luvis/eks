@@ -31,7 +31,7 @@
 
 This repository provisions a production-ready Amazon EKS cluster using Terraform. Every design decision follows the official AWS EKS Best Practices Guide. The cluster is built for:
 
-- **Security** — encrypted secrets, private nodes, IRSA, IMDSv2, network policies
+- **Security** — encrypted EBS volumes, private nodes, IRSA, IMDSv2, network policies
 - **Reliability** — multi-AZ, dedicated system nodes, CoreDNS HA, auto node repair
 - **Scalability** — Karpenter dynamically provisions nodes in seconds based on pod demand
 - **Cost efficiency** — Spot instances for application workloads, gp3 storage, no unnecessary resources
@@ -58,7 +58,7 @@ The repository is split into two independent Terraform roots:
 │  │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐      │  │
 │  │  │    Public    │    │    Public    │    │    Public    │      │  │
 │  │  │ 10.0.48.0/24 │    │ 10.0.49.0/24 │    │ 10.0.50.0/24 │      │  │
-│  │  │  NAT Gateway │    │  NAT Gateway │    │  NAT Gateway │      │  │
+│  │  │  NAT Gateway │    │ NAT (opt-in) │    │ NAT (opt-in) │      │  │
 │  │  │  Internet LB │    │  Internet LB │    │  Internet LB │      │  │
 │  │  └──────────────┘    └──────────────┘    └──────────────┘      │  │
 │  │         │                   │                   │              │  │
@@ -106,7 +106,7 @@ Other Pods / Services  (all traffic stays on private IPs inside the VPC)
 
 ### Node Communication
 
-All node-to-node and pod-to-pod traffic uses **private VPC IPs only**. Nodes have no public IP addresses. Outbound internet access (image pulls, AWS API calls) routes through NAT Gateways. Nothing outside the VPC can reach nodes or pods directly.
+All node-to-node and pod-to-pod traffic uses **private VPC IPs only**. Nodes have no public IP addresses. Outbound internet access (image pulls, AWS API calls) routes through a NAT gateway — one for the VPC by default, or one per AZ via `single_nat_gateway = false`. Nothing outside the VPC can reach nodes or pods directly.
 
 ---
 
@@ -123,8 +123,9 @@ All node-to-node and pod-to-pod traffic uses **private VPC IPs only**. Nodes hav
 | **VPC CNI** | latest | Native AWS pod networking with prefix delegation |
 | **CoreDNS** | latest | Cluster DNS with lameduck shutdown and proportional autoscaling |
 | **Node Monitoring Agent** | latest | Detects fatal node conditions and triggers auto-repair |
-| **KMS (×2)** | — | Customer-managed encryption for Secrets and EBS volumes |
 | **Network Policies** | — | Default-deny with explicit allow rules per namespace |
+| **VPC Endpoints** | — | S3 gateway endpoint on by default; interface endpoints opt-in |
+| **API Gateway** | HTTP API | Optional edge in front of workloads — throttling, JWT auth, access logs |
 
 ---
 
@@ -134,7 +135,7 @@ All node-to-node and pod-to-pod traffic uses **private VPC IPs only**. Nodes hav
 eks/
 │
 ├── bootstrap/                    # Step 1 — run once to create state bucket
-│   ├── main.tf                   # S3 bucket + KMS key
+│   ├── main.tf                   # S3 bucket (versioned, SSE-S3 encrypted)
 │   ├── variables.tf
 │   ├── outputs.tf                # Prints backend.tf snippet after apply
 │   ├── providers.tf
@@ -143,22 +144,38 @@ eks/
 │
 └── terraform/                    # Step 2 — main cluster
     ├── backend.tf                # Created manually from bootstrap output (gitignored)
+    ├── main.tf                   # Module composition — wiring and ordering only
     ├── versions.tf               # Pinned provider versions
     ├── providers.tf              # AWS, Kubernetes, Helm, kubectl providers
     ├── locals.tf                 # Computed values: AZs, CIDRs, common tags
     ├── variables.tf              # All input variables with documented defaults
-    ├── data.tf                   # AWS data sources (AZs, caller identity, partition)
-    ├── kms.tf                    # KMS key for Secrets encryption + KMS key for EBS
-    ├── vpc.tf                    # VPC, subnets, NAT GW, flow logs, subnet tags
-    ├── eks.tf                    # EKS cluster, managed add-ons, system node group
-    ├── irsa.tf                   # IRSA roles for EBS CSI driver and ALB Controller
-    ├── karpenter.tf              # Karpenter IAM, Helm release, NodeClass, NodePool
+    ├── data.tf                   # AWS data sources (availability zones)
+    ├── outputs.tf                # Cluster endpoint, kubeconfig command, subnet IDs
     ├── alb_controller.tf         # AWS Load Balancer Controller Helm release
     ├── storage.tf                # gp3 default StorageClass, demote gp2
     ├── network_policies.tf       # Default-deny NetworkPolicy + CoreDNS autoscaler
-    ├── outputs.tf                # Cluster endpoint, kubeconfig command, subnet IDs
-    └── terraform.tfvars.example  # Example values — copy to terraform.tfvars
+    ├── terraform.tfvars.example  # Example values — copy to terraform.tfvars
+    │
+    └── modules/                  # One directory per infrastructure concern
+        ├── network/              # VPC, subnets, NAT GWs, flow logs, discovery tags
+        ├── eks-control-plane/    # EKS cluster, OIDC provider, node security group
+        ├── eks-managed-node-group/  # Fixed system node group + launch template
+        ├── eks-addons/           # EKS managed add-ons (aws_eks_addon)
+        ├── irsa/                 # One IAM role per workload identity
+        ├── karpenter/            # Karpenter IAM/SQS, Helm release, NodeClass, NodePool
+        └── api-gateway/          # HTTP API + VPC Link + internal NLB (optional)
 ```
+
+Each module holds `main.tf`, `variables.tf`, `outputs.tf`, and `versions.tf`. The
+modules wrap the official `terraform-aws-modules` upstreams — EKS `~> 21.25`,
+VPC `~> 6.7`, IAM `~> 6.8` — so the readable layout costs nothing in
+battle-tested behaviour.
+
+`terraform/main.tf` is the only place modules are wired together, and it owns
+the one ordering rule that matters: the VPC CNI add-on is installed **before**
+the system node group (nodes without a CNI never reach `ACTIVE`), and every
+other add-on **after** it (CoreDNS and the EBS CSI driver need schedulable
+nodes). That is why `eks-addons` is instantiated twice.
 
 ---
 
@@ -173,7 +190,7 @@ eks/
 
 **AWS permissions required:**
 
-The IAM user or role running Terraform needs permissions to create EKS clusters, VPCs, IAM roles, KMS keys, S3 buckets, EC2 instances, and associated resources. In most organisations this is a dedicated `terraform-deployer` role.
+The IAM user or role running Terraform needs permissions to create EKS clusters, VPCs, IAM roles, S3 buckets, EC2 instances, and associated resources. In most organisations this is a dedicated `terraform-deployer` role.
 
 ---
 
@@ -191,7 +208,7 @@ cp terraform.tfvars.example terraform.tfvars
 Edit `terraform.tfvars`:
 
 ```hcl
-aws_region  = "us-east-1"
+aws_region  = "ap-south-1"
 project     = "luvis"
 bucket_name = "luvis-terraform-state-eks-2026"  # must be globally unique
 ```
@@ -218,9 +235,8 @@ terraform {
   backend "s3" {
     bucket       = "luvis-terraform-state-eks-2026"
     key          = "prod/eks/terraform.tfstate"
-    region       = "us-east-1"
+    region       = "ap-south-1"
     encrypt      = true
-    kms_key_id   = "arn:aws:kms:us-east-1:xxxxxxxxxxxx:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
     use_lockfile = true
   }
 }
@@ -240,7 +256,7 @@ cp terraform.tfvars.example terraform.tfvars
 Edit `terraform.tfvars` with your values:
 
 ```hcl
-aws_region   = "us-east-1"
+aws_region   = "ap-south-1"
 cluster_name = "prod-eks"
 project      = "luvis"
 environment  = "prod"
@@ -278,7 +294,7 @@ The EKS control plane takes 10–15 minutes. This is an AWS-side operation — n
 ### Step 5 — Configure kubectl
 
 ```bash
-aws eks update-kubeconfig --region us-east-1 --name prod-eks
+aws eks update-kubeconfig --region ap-south-1 --name prod-eks
 kubectl get nodes
 ```
 
@@ -304,7 +320,7 @@ cd ../bootstrap
 terraform destroy
 ```
 
-> The KMS key has a 7-day deletion window enforced by AWS. It will not be fully deleted for 7 days after destroy.
+> The state bucket is versioned — `terraform destroy` fails until all object versions are removed. Empty it first (`aws s3 rm s3://<bucket> --recursive` plus version cleanup) or delete the bucket manually.
 
 ---
 
@@ -312,61 +328,53 @@ terraform destroy
 
 ### Security
 
-#### 1. Encryption at Rest — Kubernetes Secrets
+#### 1. Encryption at Rest — EBS Volumes
 
-All Kubernetes Secrets are envelope-encrypted using a customer-managed KMS key. Without this, Secrets are stored as base64 in etcd — readable by anyone with etcd access.
+All node root volumes and persistent volumes created from the default StorageClass are encrypted with the AWS-managed EBS key (`aws/ebs`). No customer-managed KMS keys are used.
 
 ```hcl
-# eks.tf
-encryption_config = {
-  provider_key_arn = aws_kms_key.eks.arn
-  resources        = ["secrets"]
+# modules/eks-managed-node-group/main.tf — system node group root volume
+ebs = {
+  encrypted = true
+}
+
+# storage.tf — gp3 default StorageClass
+parameters = {
+  encrypted = "true"
 }
 ```
 
-#### 2. Encryption at Rest — EBS Volumes
+> Secrets envelope encryption is disabled (`encryption_config = null`, the default in `modules/eks-control-plane`). Kubernetes Secrets are stored base64-encoded in EKS-managed etcd, which AWS encrypts at rest with an AWS-owned key. Enable envelope encryption with a customer-managed key if compliance requires it.
 
-All node root volumes and persistent volumes created from the default StorageClass are encrypted using a dedicated customer-managed KMS key with automatic annual rotation.
-
-```hcl
-# kms.tf
-resource "aws_kms_key" "ebs" {
-  enable_key_rotation = true
-}
-```
-
-#### 3. IMDSv2 — Prevent Credential Theft
+#### 2. IMDSv2 — Prevent Credential Theft
 
 IMDSv2 requires an HTTP `PUT` request with a session token before the metadata endpoint responds. This blocks Server-Side Request Forgery (SSRF) attacks where a compromised application fetches `http://169.254.169.254/latest/meta-data/iam/security-credentials/` to steal node IAM credentials.
 
 ```hcl
-# Enforced on system nodes (eks.tf) and Karpenter nodes (karpenter.tf)
+# Enforced in modules/eks-managed-node-group and modules/karpenter
 metadata_options = {
   http_tokens                 = "required"
   http_put_response_hop_limit = 1   # prevents containers from reaching IMDS via hop
 }
 ```
 
-#### 4. IRSA — IAM Roles for Service Accounts
+#### 3. IRSA — IAM Roles for Service Accounts
 
 Every component that needs AWS access (EBS CSI driver, ALB Controller) gets its own dedicated IAM role with least-privilege policies. The role is bound to the component's Kubernetes ServiceAccount via OIDC federation. No long-lived credentials are stored anywhere — pods receive short-lived STS tokens automatically.
 
 ```hcl
-# irsa.tf
+# main.tf
 module "ebs_csi_irsa" {
-  source                = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts"
-  name                  = "${local.name}-ebs-csi"
-  attach_ebs_csi_policy = true
-  oidc_providers = {
-    main = {
-      provider_arn               = module.eks.oidc_provider_arn
-      namespace_service_accounts = ["kube-system:ebs-csi-controller-sa"]
-    }
-  }
+  source = "./modules/irsa"
+
+  name                       = "${local.name}-ebs-csi"
+  oidc_provider_arn          = module.eks_control_plane.oidc_provider_arn
+  namespace_service_accounts = ["kube-system:ebs-csi-controller-sa"]
+  attach_ebs_csi_policy      = true
 }
 ```
 
-#### 5. EKS Access Entries — No aws-auth ConfigMap
+#### 4. EKS Access Entries — No aws-auth ConfigMap
 
 Cluster access is managed through EKS Access Entries — IAM principals are mapped to cluster permissions via the EKS API. This replaces the `aws-auth` ConfigMap which is error-prone, must be edited carefully with `kubectl`, and can lock you out of the cluster if misconfigured.
 
@@ -374,7 +382,7 @@ Cluster access is managed through EKS Access Entries — IAM principals are mapp
 enable_cluster_creator_admin_permissions = true
 ```
 
-#### 6. Control Plane Audit Logging
+#### 5. Control Plane Audit Logging
 
 All five control plane log types are enabled and sent to CloudWatch Logs. These are mandatory for security auditing, incident response, and compliance.
 
@@ -386,7 +394,7 @@ All five control plane log types are enabled and sent to CloudWatch Logs. These 
 | `controllerManager` | Reconciliation loops, garbage collection, replica management |
 | `scheduler` | Pod placement decisions and scheduling failures |
 
-#### 7. Network Policies — Default Deny
+#### 6. Network Policies — Default Deny
 
 All pod traffic is denied by default in `kube-system`. Explicit allow rules are added only for what is required. Apply this pattern to every application namespace.
 
@@ -404,11 +412,11 @@ spec:
 
 VPC CNI network policy enforcement is activated via `ENABLE_NETWORK_POLICY=true`, which runs an eBPF-based policy engine directly in the Linux kernel on every node — no additional CNI plugin required.
 
-#### 8. Private Worker Nodes
+#### 7. Private Worker Nodes
 
 All worker nodes are placed in private subnets and have no public IP addresses. The only inbound path into the cluster is through an ALB or NLB provisioned by the Load Balancer Controller. Nodes reach the internet for outbound traffic (image pulls, AWS API calls) only through NAT Gateways.
 
-#### 9. AL2023 Node Operating System
+#### 8. AL2023 Node Operating System
 
 Amazon Linux 2023 provides:
 
@@ -417,7 +425,7 @@ Amazon Linux 2023 provides:
 - **rpm-ostree** immutable updates — the OS is updated atomically, not package by package, eliminating configuration drift between nodes
 - Regular AWS security patches and CVE fixes
 
-#### 10. AMI Version Pinning
+#### 9. AMI Version Pinning
 
 ```yaml
 amiSelectorTerms:
@@ -442,13 +450,31 @@ The VPC uses three subnet tiers, each with a distinct purpose and security postu
 
 The intra subnets have no route table entry for the internet. The control plane ENIs live here — they reach the API server entirely within the VPC.
 
-#### 2. One NAT Gateway Per Availability Zone
+#### 2. NAT Gateway Topology
 
 ```hcl
-one_nat_gateway_per_az = true
+single_nat_gateway = true   # default — one NAT for the whole VPC
 ```
 
-A single NAT Gateway means that if its AZ goes down, all nodes in other AZs lose internet connectivity. With one per AZ, each AZ is completely self-sufficient. At scale, a single NAT GW also creates a cross-AZ traffic charge of `$0.01/GB` for every node in AZ-2 and AZ-3 routing through AZ-1. One per AZ eliminates this charge entirely.
+This is a deliberate cost/availability trade-off, exposed as a single variable.
+
+| | `single_nat_gateway = true` (default) | `false` — one per AZ |
+|---|---|---|
+| Fixed cost | ~$33/month | ~$97/month |
+| Cross-AZ data charge | ~$0.01/GB on egress from the other two AZs | none |
+| AZ failure | all outbound traffic stops | each AZ stays self-sufficient |
+
+Inbound traffic never traverses a NAT gateway, so serving through an ALB is
+unaffected either way. What an AZ failure breaks under a single NAT is
+*outbound*: image pulls, calls to AWS APIs over the internet, and Karpenter's
+ability to bring up replacement nodes — precisely what you need during an
+incident. Set `single_nat_gateway = false` for clusters where that matters.
+
+Per-AZ also becomes the cheaper option above roughly 4–5 TB/month of NAT
+egress, where the cross-AZ charge exceeds the $65/month of extra gateways.
+Before adding gateways, add VPC endpoints: an S3 gateway endpoint is free and
+ECR interface endpoints remove the largest single source of NAT data
+processing (image pulls).
 
 #### 3. VPC CNI Prefix Delegation
 
@@ -484,6 +510,53 @@ private_subnet_tags = {
 #### 5. VPC Flow Logs
 
 All VPC traffic metadata is captured to CloudWatch Logs. Flow logs record source and destination IP, port, protocol, and accept/drop status. Used for security analysis, detecting lateral movement, and debugging connectivity issues.
+
+#### 6. VPC Endpoints
+
+```hcl
+enable_s3_endpoint  = true            # gateway endpoint — free
+interface_endpoints = []              # e.g. ["ecr.api", "ecr.dkr", "sts"]
+```
+
+Endpoints keep AWS API traffic on the AWS network instead of routing it out
+through the NAT gateway. The two kinds have completely different economics:
+
+| | Cost | Verdict |
+|---|---|---|
+| **Gateway** (S3) | free | Always on. ECR image layers are stored in S3, so this removes the single largest source of NAT data-processing charges. |
+| **Interface** (ECR, STS, logs, …) | $0.01/hr per AZ — ~$22/month per service across 3 AZs, plus $0.01/GB | Opt-in. Worth it once NAT data processing at $0.045/GB on that service exceeds the hourly cost. |
+
+The second reason to add the interface set is availability, not cost: with
+`ecr.api`, `ecr.dkr`, and `sts` reachable privately, image pulls and IRSA token
+exchange no longer depend on the NAT gateway's AZ — which pairs directly with
+running a single NAT.
+
+#### 7. API Gateway Ingress (optional)
+
+```hcl
+enable_api_gateway = true
+```
+
+An HTTP API in front of cluster workloads, for throttling, JWT authorization,
+and access logging at the edge:
+
+```
+Client → API Gateway (HTTP API) → VPC Link → internal NLB → pod IPs
+```
+
+Terraform owns the NLB, listener, and target group rather than letting a Service
+annotation create them. That is deliberate: API Gateway's private integration
+needs a **listener ARN at apply time**, and a controller-created NLB does not
+exist until a Service is applied. Pods are attached afterwards with a
+`TargetGroupBinding` — `terraform output api_gateway_target_group_binding`
+prints a ready-to-edit manifest.
+
+Requests never traverse the public internet inside AWS: the VPC Link ENIs sit in
+the private subnets, and the NLB security group accepts traffic only from them.
+
+> WAF cannot be attached to an HTTP API. If you need WAF at the edge, front it
+> with CloudFront, or switch to a REST API (v1), which costs $3.50 per million
+> requests against the HTTP API's $1.00.
 
 ---
 
@@ -542,7 +615,7 @@ The Node Monitoring Agent runs as a DaemonSet on every node. It detects fatal co
 volume_binding_mode = "WaitForFirstConsumer"
 ```
 
-EBS volumes are AZ-specific — a volume in `us-east-1a` cannot be attached to a node in `us-east-1b`. `WaitForFirstConsumer` delays volume creation until a pod is scheduled on a node. The volume is then created in the same AZ as the node. Without this setting, a volume might be created in the wrong AZ and the pod will stay in `Pending` indefinitely.
+EBS volumes are AZ-specific — a volume in `ap-south-1a` cannot be attached to a node in `ap-south-1b`. `WaitForFirstConsumer` delays volume creation until a pod is scheduled on a node. The volume is then created in the same AZ as the node. Without this setting, a volume might be created in the wrong AZ and the pod will stay in `Pending` indefinitely.
 
 #### 8. Pod Disruption Budgets
 
@@ -667,7 +740,7 @@ Every Karpenter-managed node is replaced after 30 days regardless of utilisation
 ```
 1. New AMI released by AWS
 2. Test new AMI alias in dev cluster
-3. Update alias in karpenter.tf: al2023@v20260601
+3. Update `ami_alias` on the karpenter module: al2023@v20260601
 4. terraform apply
 5. Over the next 30 days, nodes expire and Karpenter recreates them with the new AMI
 ```
@@ -701,7 +774,7 @@ All `PersistentVolumeClaims` that do not specify a StorageClass use gp3 by defau
 | Baseline throughput | 128–250 MB/s | 125 MB/s |
 | Independent scaling | No | Yes — IOPS and throughput separately |
 
-All volumes are encrypted by default using the EBS KMS key.
+All volumes are encrypted by default using the AWS-managed `aws/ebs` key.
 
 #### Adding More Storage
 
@@ -804,7 +877,7 @@ cluster_version = "1.36"
 terraform apply
 
 # 3. Update the system node group AMI type if needed
-# eks.tf: ami_type = "AL2023_x86_64_STANDARD"
+# modules/eks-managed-node-group: ami_type = "AL2023_x86_64_STANDARD"
 # Then: terraform apply — nodes are drained and replaced rolling
 
 # 4. Karpenter nodes rotate automatically over 30 days via expireAfter
@@ -834,7 +907,7 @@ aws ssm get-parameters-by-path \
   --query 'Parameters[*].Name' \
   --output table
 
-# Update karpenter.tf
+# Update the karpenter module's ami_alias
 #   amiSelectorTerms:
 #     - alias: al2023@v20260601
 
@@ -892,7 +965,7 @@ aws eks describe-addon-versions \
 ### Refresh kubeconfig
 
 ```bash
-aws eks update-kubeconfig --region us-east-1 --name prod-eks
+aws eks update-kubeconfig --region ap-south-1 --name prod-eks
 ```
 
 ### Access Node via Session Manager
@@ -930,11 +1003,19 @@ The following are minimum costs with no application workloads running.
 |---|---|---|
 | EKS control plane | 1 cluster | ~$72 |
 | m5.large system nodes | 2 × ON_DEMAND | ~$138 |
-| NAT Gateway | 3 × (one per AZ) | ~$97 |
+| NAT Gateway | 1 (default; ~$97 for one per AZ) | ~$33 |
 | EBS root volumes (50GB gp3) | 2 nodes | ~$8 |
-| KMS keys | 2 keys | ~$2 |
 | CloudWatch Logs (flow logs + control plane) | Variable | ~$10 |
-| **Minimum total** | | **~$327/month** |
+| **Minimum total** | | **~$261/month** |
+
+Opt-in components, none of which are enabled by default:
+
+| Resource | Quantity | $/month |
+|---|---|---|
+| Interface VPC endpoints | per service, 3 AZs | ~$22 |
+| Second and third NAT gateway | `single_nat_gateway = false` | ~$65 |
+| API Gateway internal NLB | 1 | ~$16 |
+| API Gateway requests | per million | ~$1 |
 
 Application node costs are additional and proportional to traffic. Karpenter Spot instances reduce application node costs by 60–90% compared to On-Demand.
 
